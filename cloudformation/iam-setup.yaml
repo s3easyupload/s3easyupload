@@ -1,0 +1,244 @@
+AWSTemplateFormatVersion: '2010-09-09'
+
+Metadata:
+  Author: s3easyupload
+  License: S3EasyUpload Community License
+  Version: 1.0.0-community
+  Origin: s3easyupload.com
+
+Description: >
+  IAM Role for deploying s3easyupload stack resources.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Description: Logical project name to prefix IAM role name
+    Default: s3easyupload
+  Tier:
+    Type: String
+    Description: Application tier
+    Default: community
+  Environment:
+    Type: String
+    Description: Environment name
+    Default: dev
+  AccountGithub:
+    Type: String
+    Description: GitHub owner name (leave empty if not using GitHub Actions)
+  RepoTierGithub:
+    Type: String
+    Description: GitHub repository name (leave empty if not using GitHub Actions)
+  OIDCProviderArn:
+    Type: String
+    Description: GitHub Actions OIDC provider ARN (leave empty if not using GitHub Actions)
+
+Conditions:
+  HasOIDCProvider: !Not [!Equals [!Ref OIDCProviderArn, ""]]
+
+Resources:
+  S3EasyUploadRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-${Tier}-${Environment}"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudformation.amazonaws.com
+            Action: sts:AssumeRole
+
+          - !If
+            - HasOIDCProvider
+            - Effect: Allow
+              Principal:
+                Federated: !Ref OIDCProviderArn
+              Action: sts:AssumeRoleWithWebIdentity
+              Condition:
+                StringLike:
+                  token.actions.githubusercontent.com:sub: !Sub "repo:${AccountGithub}/${RepoTierGithub}:*"
+                StringEquals:
+                  token.actions.githubusercontent.com:aud: sts.amazonaws.com
+            - !Ref AWS::NoValue           
+      
+      Path: "/"
+
+  S3Policy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: !Sub "${ProjectName}-s3-policy-${Tier}-${Environment}"
+      Roles:
+        - !Ref S3EasyUploadRole
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - s3:CreateBucket
+              - s3:PutBucketWebsite
+              - s3:PutBucketPublicAccessBlock
+              - s3:GetBucketPolicy
+              - s3:PutBucketPolicy
+              - s3:PutEncryptionConfiguration
+              - s3:PutBucketAcl
+              - s3:PutBucketOwnershipControls
+              - s3:DeleteBucket
+              - s3:ListBucket
+              - s3:GetBucketLocation
+              - s3:PutObject
+              - s3:GetObject
+              - s3:DeleteObject
+              - s3:DeleteBucketPolicy
+              - s3:PutBucketCORS
+              - s3:DeleteObject
+              - s3:DeleteObjectVersion
+              - s3:ListBucketVersions
+              - s3:PutLifecycleConfiguration
+            Resource:
+              - !Sub "arn:aws:s3:::${ProjectName}-site-${Tier}-${Environment}-${AWS::AccountId}"
+              - !Sub "arn:aws:s3:::${ProjectName}-site-${Tier}-${Environment}-${AWS::AccountId}/*"
+              - !Sub "arn:aws:s3:::${ProjectName}-upload-${Tier}-${Environment}-${AWS::AccountId}"
+              - !Sub "arn:aws:s3:::${ProjectName}-upload-${Tier}-${Environment}-${AWS::AccountId}/*"
+
+  LambdaPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: !Sub "${ProjectName}-lambda-policy-${Tier}-${Environment}"
+      Roles:
+        - !Ref S3EasyUploadRole
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - lambda:CreateFunction
+              - lambda:UpdateFunctionCode
+              - lambda:GetFunction
+              - lambda:DeleteFunction
+              - lambda:InvokeFunction
+              - lambda:RemovePermission
+              - lambda:AddPermission
+            Resource: 
+              - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${ProjectName}-presign-${Tier}-${Environment}"
+              - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${ProjectName}-upload-${Tier}-${Environment}"
+              
+  CloudFormationPolicyWildcard:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: !Sub "${ProjectName}-cfn-policy-wildcard-${Tier}-${Environment}"
+      Roles:
+        - !Ref S3EasyUploadRole
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - cloudformation:CreateChangeSet
+              - cloudformation:ListStacks
+              - cloudformation:DescribeStacks
+              - cloudformation:DescribeStackEvents
+              - cloudformation:DescribeChangeSet
+              - cloudformation:GetTemplateSummary
+              - cloudformation:ListChangeSets 
+            Resource: "*"
+
+  CloudFormationPolicyScoped:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: !Sub "${ProjectName}-cfn-policy-scoped-${Tier}-${Environment}"
+      Roles:
+        - !Ref S3EasyUploadRole
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - cloudformation:CreateStack
+              - cloudformation:UpdateStack
+              - cloudformation:DescribeStacks
+              - cloudformation:DeleteStack
+              - cloudformation:CreateChangeSet 
+              - cloudformation:ExecuteChangeSet 
+              - cloudformation:GetTemplate
+              - cloudformation:ValidateTemplate
+            Resource: !Sub "arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${ProjectName}-*/*"
+
+  IAMPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: !Sub "${ProjectName}-iam-policy-${Tier}-${Environment}"
+      Roles:
+        - !Ref S3EasyUploadRole
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - iam:GetRole
+              - iam:PassRole
+              - iam:GetRolePolicy
+            Resource: !Sub "arn:aws:iam::${AWS::AccountId}:role/${ProjectName}-*"
+          - Effect: Allow
+            Action:
+              - iam:CreateRole
+              - iam:DeleteRole
+              - iam:DeleteRolePolicy
+              - iam:PutRolePolicy
+              - iam:DeleteRolePolicy
+            Resource: !Sub "arn:aws:iam::${AWS::AccountId}:role/${ProjectName}-lambda*"
+
+  CloudFrontPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: !Sub "${ProjectName}-cloudfront-policy-${Tier}-${Environment}"
+      Roles:
+        - !Ref S3EasyUploadRole
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - cloudfront:CreateDistribution
+              - cloudfront:UpdateDistribution
+              - cloudfront:DeleteDistribution
+              - cloudfront:GetDistribution
+              - cloudfront:ListDistributions
+              - cloudfront:TagResource
+              - cloudfront:UntagResource
+              - cloudfront:CreateOriginAccessControl
+              - cloudfront:GetOriginAccessControl
+              - cloudfront:ListOriginAccessControls
+              - cloudfront:DeleteOriginAccessControl
+            # Wildcard mandatory for CloudFront distribution management
+            Resource: "*"
+
+  ApiGatewayPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: !Sub "${ProjectName}-apigateway-policy-${Tier}-${Environment}"
+      Roles:
+        - !Ref S3EasyUploadRole
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - apigateway:GET
+              - apigateway:PUT
+              - apigateway:DELETE
+              - apigateway:PATCH
+              - apigateway:POST            
+            Resource:
+              - !Sub "arn:aws:apigateway:${AWS::Region}::/restapis"
+              - !Sub "arn:aws:apigateway:${AWS::Region}::/restapis/*"
+              - !Sub "arn:aws:apigateway:${AWS::Region}::/restapis/*/*"
+  
+Outputs:
+  RoleName:
+    Description: IAM role name
+    Value: !Ref S3EasyUploadRole
+  RoleArn:
+    Description: IAM role ARN
+    Value: !GetAtt S3EasyUploadRole.Arn
+
+

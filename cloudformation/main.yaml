@@ -1,0 +1,685 @@
+AWSTemplateFormatVersion: '2010-09-09'
+
+Metadata:
+  Author: s3easyupload
+  License: S3EasyUpload Community License
+  Version: 1.0.0-community
+  Origin: s3easyupload.com
+
+Description: >
+  Deploys the complete s3easyupload infrastructure including
+  static website hosting, secure uploads, CloudFront distribution,
+  API Gateway, Lambda functions and Amazon S3.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Description: Logical project name to prefix IAM role name
+    Default: s3easyupload
+  Tier:
+    Type: String
+    Description: tier
+    Default: community
+  Environment:
+    Type: String
+    Description: Environment name
+    Default: dev
+  HTMLVersion:
+    Type: String
+    Description: Release version (optional, change to force HTML refresh)
+    Default: latest
+
+Resources:
+
+  WebsiteBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub ${ProjectName}-site-${Tier}-${Environment}-${AWS::AccountId}
+      AccessControl: Private
+      WebsiteConfiguration:
+        IndexDocument: index.html
+        ErrorDocument: error.html
+
+  UploadHTMLFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-upload-${Tier}-${Environment}"
+      Handler: index.handler
+      Runtime: python3.12
+      Timeout: 10
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import traceback
+          import urllib.request
+
+          
+          def send_cfn_response(event, context, status, data=None, physical_resource_id=None, reason=None):
+            """Send a response to the CloudFormation pre-signed ResponseURL."""
+            response_url = event['ResponseURL']
+  
+            if physical_resource_id is None:
+                # Use a predictable, stable PhysicalResourceId to avoid unnecessary replacements
+                stack_id = event.get('StackId', 'unknown-stack')
+                logical_id = event.get('LogicalResourceId', 'UploadHTMLTrigger')
+                physical_resource_id = f"{stack_id}/{logical_id}"
+  
+            response_body = {
+                "Status": status,
+                "Reason": reason or f"See CloudWatch Logs for details: {context.log_stream_name}",
+                "PhysicalResourceId": physical_resource_id,
+                "StackId": event["StackId"],
+                "RequestId": event["RequestId"],
+                "LogicalResourceId": event["LogicalResourceId"],
+                "NoEcho": False,
+                "Data": data or {}
+            }
+  
+            body = json.dumps(response_body).encode("utf-8")
+            req = urllib.request.Request(response_url, data=body, method="PUT")
+            req.add_header("Content-Type", "")
+            req.add_header("Content-Length", str(len(body)))
+            with urllib.request.urlopen(req) as resp:
+                _ = resp.read()
+
+
+          def handler(event, context):
+              s3 = boto3.client('s3')
+
+              try:
+                request_type = event.get('RequestType')
+                props = event.get('ResourceProperties', {})              
+                bucket = props['BucketName']
+                api_url = props['ApiInvokeUrl']
+  
+                html = """<!DOCTYPE html>
+                          <html>
+                          <head>
+                            <meta charset="utf-8" />
+                            <title>s3easyupload</title>
+                            <style>
+                              body { 
+                                font-family: sans-serif; 
+                                padding: 2rem; 
+                                text-align: center; 
+                                background: #f5f5f5;
+                              }
+                              .dropzone { 
+                                border: 3px dashed #999; 
+                                padding: 2rem; 
+                                margin: 2rem auto; 
+                                max-width: 500px; 
+                                background: #fff; 
+                                border-radius: 10px;
+                                transition: 0.3s;
+                              }
+                              .hover { 
+                                border-color: #555; 
+                                background: #eef; 
+                              }
+                              .upload-list {
+                                max-width: 600px;
+                                margin: 0 auto;
+                                text-align: left;
+                              }
+                              .upload-item {
+                                border: 1px solid #ccc;
+                                padding: 10px;
+                                margin-top: 10px;
+                                border-radius: 6px;
+                                background: #fafafa;
+                              }
+                              .file-name {
+                                font-weight: bold;
+                                margin-bottom: 5px;
+                              }
+                              .progress-bar {
+                                width: 100%;
+                                height: 8px;
+                                background: #eee;
+                                border-radius: 4px;
+                                overflow: hidden;
+                                margin-top: 5px;
+                              }
+                              .progress-fill {
+                                height: 100%;
+                                width: 0%;
+                                background: #4caf50;
+                                transition: width 0.1s linear;
+                              }
+                              .status {
+                                margin-top: 6px;
+                                font-size: 0.9rem;
+                                color: #555;
+                              }                              
+                              .upload-item {
+                                position: relative;
+                              }
+                              .close-btn {
+                                position: absolute;
+                                top: 8px;
+                                right: 10px;
+                                border: none;
+                                background: transparent;
+                                color: #999;
+                                font-size: 18px;
+                                line-height: 1;
+                                cursor: pointer;
+                                display: none;             
+                              }                             
+                              .close-btn:hover {
+                                color: #333;
+                              }                              
+                              .disclaimer {
+                                margin-top: 3rem;
+                                font-size: .9rem; 
+                                color:#888;
+                              }
+                            </style>
+                          </head>
+                          <body>
+                          
+                          <h1>Upload your file</h1>
+                          <p>Drag & drop a file below. It will be uploaded to a temporary S3 bucket.</p>
+                          
+                          <div class="dropzone" id="dropzone">Drop your file here</div>
+                          
+                          <div class="upload-list" id="upload-list"></div>
+                          
+                          
+                          <script>
+                          function formatSpeed(bytesPerSec) {
+                            if (bytesPerSec > 1024 * 1024) {
+                                return (bytesPerSec / (1024 * 1024)).toFixed(1) + " MB/s";
+                            }
+                            return (bytesPerSec / 1024).toFixed(1) + " KB/s";
+                          }
+                          
+                          function createUploadItem(file) {
+                            const container = document.createElement("div");
+                            container.className = "upload-item";
+                          
+                            container.innerHTML = `
+                              <div class="file-name">${file.name}</div>
+                              <button class="close-btn" title="Remove">&times;</button>
+                              <div class="progress-bar"><div class="progress-fill"></div></div>
+                              <div class="status">Starting upload...</div>
+                            `;
+                          
+                            document.getElementById("upload-list").appendChild(container);
+
+                            const fill = container.querySelector(".progress-fill");
+                            const status = container.querySelector(".status");
+                            const closeBtn = container.querySelector(".close-btn");                          
+                            
+                            function markDone({ text, color }) {
+                              status.textContent = text;
+                              status.style.color = color || "#555";                            
+                              if (fill && fill.parentElement) fill.parentElement.style.display = "none";                            
+                              closeBtn.style.display = "inline";                            
+                              closeBtn.onclick = () => container.remove();
+                            }
+
+                            return {
+                              element: container,
+                              fill,
+                              status,
+                              closeBtn,
+                              markDone
+                            };
+                          }
+                          
+                          
+                          async function uploadFile(file) {
+                            const item = createUploadItem(file);
+                          
+                            // Prevent folder upload (size = 0 AND no type)
+                            if (file.size === 0 && !file.type) {                              
+                              item.markDone({ text: "Upload failed: Cannot upload a folder", color: "red" });
+                              return;
+                            }
+                          
+                            item.status.textContent = "Requesting presigned URL...";
+                          
+                            let res, data;
+                          
+                            try {
+                              res = await fetch(`__API_URL__/presign?filename=${encodeURIComponent(file.name)}&size=${file.size}`);
+                            } catch (e) {
+                              item.markDone({ text: "Upload failed: Network error", color: "red"});
+                              return;
+                            }
+                          
+                            if (!res.ok) {
+                              const err = await res.json().catch(() => ({}));
+                              const reason = err.error || "Failed to get upload URL";
+                              item.markDone({ text: `Upload failed: ${reason}`, color: "red" });
+                              return;
+                            }
+                          
+                            data = await res.json();
+                            const url = data.url;
+                          
+                            return new Promise((resolve, reject) => {
+                              const xhr = new XMLHttpRequest();
+                              xhr.open("PUT", url);
+                          
+                              let lastLoaded = 0;
+                              let lastTime = Date.now();
+                          
+                              xhr.upload.onprogress = (event) => {
+                                if (event.lengthComputable) {
+                                  const percent = (event.loaded / event.total) * 100;
+                                  item.fill.style.width = percent + "%";
+                          
+                                  const now = Date.now();
+                                  const elapsed = (now - lastTime) / 1000;
+                                  const bytes = event.loaded - lastLoaded;
+                                  const speed = formatSpeed(bytes / elapsed);
+                          
+                                  item.status.textContent = `Uploading... ${percent.toFixed(0)}% — ${speed}`;
+                          
+                                  lastLoaded = event.loaded;
+                                  lastTime = now;
+                                }
+                              };
+                          
+                              xhr.onload = () => {
+                                if (xhr.status >= 200 && xhr.status < 300) {
+                                  item.fill.style.width = "100%";
+                                  item.markDone({ text: "Uploaded ✔", color: "green" });
+                                } else {
+                                  item.markDone({ text: `Upload failed: Server error (HTTP ${xhr.status})`, color: "red" });
+                                }
+                              };
+                          
+                              xhr.onerror = () => {
+                                item.markDone({ text: "Upload failed: Network or CORS error", color: "red" });
+                                reject();
+                              };
+                          
+                              xhr.send(file);
+                            });
+                          }
+
+
+                          const dropzone = document.getElementById("dropzone");
+                          
+                          dropzone.addEventListener("dragover", (e) => {
+                            e.preventDefault();
+                            dropzone.classList.add("hover");
+                          });
+                          dropzone.addEventListener("dragleave", () => {
+                            dropzone.classList.remove("hover");
+                          });
+                          dropzone.addEventListener("drop", (e) => {                            
+                            e.preventDefault();
+                                dropzone.classList.remove("hover");
+                            
+                                const items = e.dataTransfer.items;
+                                if (!items) return;
+                            
+                                for (const item of items) {
+                                    
+                                  if (item.kind !== "file") {
+                                              const fake = createUploadItem({ name: "Folder" });
+                                              fake.status.textContent = "Upload failed: Cannot upload a folder";
+                                              fake.status.style.color = "red";
+                                              continue;
+                                  }
+
+
+                                  const entry = item.webkitGetAsEntry
+                                      ? item.webkitGetAsEntry()
+                                      : null;
+                          
+                                  if (entry && entry.isDirectory) {
+                                      const fake = createUploadItem({ name: entry.name || "Folder" });
+                                      fake.status.textContent = "Upload failed: Cannot upload a folder";
+                                      fake.status.style.color = "red";
+                                      continue;
+                                  }
+                          
+                                  const file = item.getAsFile();
+                          
+                                  if (!file || typeof file.size !== "number") {
+                                      const name = (entry && entry.name) ? entry.name : "Unknown";
+                                      const fake = createUploadItem({ name });
+                                      fake.status.textContent = "Upload failed: Cannot upload a folder";
+                                      fake.status.style.color = "red";
+                                      continue;
+                                  }
+                          
+                                  uploadFile(file);
+                                }
+
+                          });
+                          </script>
+                          
+                          </body>
+                          </html>
+                          """
+  
+                html = html.replace("__API_URL__", api_url)
+                if request_type in ("Create", "Update"):
+                  s3.put_object(Bucket=bucket, Key='index.html', Body=html, ContentType='text/html', CacheControl='no-cache')
+                  send_cfn_response(event, context, "SUCCESS", data={"Key": "index.html"})
+                elif request_type == "Delete":
+                    # Optional: cleanup index.html; ignore errors to keep Delete robust
+                    try:
+                        s3.delete_object(Bucket=bucket, Key='index.html')
+                    except Exception:
+                        pass
+                    send_cfn_response(event, context, "SUCCESS", data={"Deleted": True})
+                else:
+                    # Unknown request type; respond success to not block the stack
+                    send_cfn_response(event, context, "SUCCESS")
+              except Exception as e:
+                  reason = f"{type(e).__name__}: {e}\n{traceback.format_exc()}"
+                  send_cfn_response(event, context, "FAILED", reason=reason)
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-lambda-site-role-${Tier}-${Environment}"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: "sts:AssumeRole"
+      Policies:
+        - PolicyName: s3-upload-html
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:DeleteObject
+                Resource: !Sub "arn:aws:s3:::${ProjectName}-site-${Tier}-${Environment}-${AWS::AccountId}/*"
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+
+  OriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Description: CloudFront access to S3
+        Name: !Sub "${ProjectName}-oac-${Tier}-${Environment}"
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        DefaultRootObject: index.html
+        HttpVersion: http2
+        Origins:
+          - Id: S3Origin
+            DomainName: !GetAtt WebsiteBucket.RegionalDomainName
+            S3OriginConfig:
+              OriginAccessIdentity: ""
+            OriginAccessControlId: !Ref OriginAccessControl
+        DefaultCacheBehavior:
+          TargetOriginId: S3Origin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD]
+          CachedMethods: [GET, HEAD]
+          Compress: true
+          ForwardedValues:
+            QueryString: false
+            Cookies:
+              Forward: none          
+          MinTTL: 0
+          DefaultTTL: 0
+          MaxTTL: 0
+        ViewerCertificate:
+          CloudFrontDefaultCertificate: true
+        PriceClass: PriceClass_100
+
+  BucketPolicyCloudFront:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref WebsiteBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub "${WebsiteBucket.Arn}/*"
+            Condition:
+              StringEquals:
+                "AWS:SourceArn": !Sub "arn:aws:cloudfront::${AWS::AccountId}:distribution/${CloudFrontDistribution}"
+
+  UploadBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub ${ProjectName}-upload-${Tier}-${Environment}-${AWS::AccountId}
+      AccessControl: Private      
+      CorsConfiguration:
+        CorsRules:
+          - AllowedMethods: [PUT, GET]
+            AllowedOrigins: ["*"] 
+            AllowedHeaders: ["*"]
+            ExposedHeaders: ["ETag"]
+            MaxAge: 300
+      
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteAfter24Hours
+            Status: Enabled
+            ExpirationInDays: 1
+            Prefix: "" 
+   
+  PresignUrlFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-presign-${Tier}-${Environment}"
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt PresignLambdaRole.Arn
+      Timeout: 10
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os          
+          import uuid
+          import urllib.parse
+
+          from botocore.config import Config
+
+          def handler(event, context):
+              s3 = boto3.client('s3', config=Config(signature_version='s3v4'))
+              qs = event.get('queryStringParameters') or {}
+              MAX_FILE_SIZE = 1 * 1024 * 1024 * 1024
+              size = int(qs.get("size", "0"))
+              
+              if size > MAX_FILE_SIZE:
+                  return {
+                      "statusCode": 400,
+                      "headers": {
+                          "Access-Control-Allow-Origin": "*"
+                      },
+                      "body": json.dumps({"error": "File too large. Max allowed size is 1GB."})
+                  }
+              bucket = os.environ['UPLOAD_BUCKET']              
+              
+              orig = qs.get('filename', 'upload.txt')
+              safe_orig = urllib.parse.unquote(orig)
+              
+              if '.' in safe_orig:
+                  base, ext = safe_orig.rsplit('.', 1)
+                  ext = '.' + ext
+              else:
+                  base = safe_orig
+                  ext = ''
+              
+              uid = uuid.uuid4().hex              
+              key = f"{base}_{uid}{ext}"
+
+              url = s3.generate_presigned_url(
+                  ClientMethod='put_object',
+                  Params={'Bucket': bucket, 'Key': key},
+                  HttpMethod='PUT',
+                  ExpiresIn=600)
+              return {
+                  "statusCode": 200,
+                  "headers": { 
+                    "Content-Type": "application/json",                    
+                    "Access-Control-Allow-Origin": "*",
+                    "Access-Control-Allow-Methods": "GET,PUT,OPTIONS",
+                    "Access-Control-Allow-Headers": "*"
+                  },
+                  "body": json.dumps({ "url": url })
+              }
+      Environment:
+        Variables:
+          UPLOAD_BUCKET: !Sub "${ProjectName}-upload-${Tier}-${Environment}-${AWS::AccountId}"
+
+  PresignLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-lambda-presign-role-${Tier}-${Environment}"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: PresignS3Policy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                Resource: !Sub "arn:aws:s3:::${UploadBucket}/*"
+              
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+
+  PresignApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub "${ProjectName}-api-${Tier}-${Environment}"
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+
+  PresignResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      ParentId: !GetAtt PresignApi.RootResourceId
+      PathPart: presign
+      RestApiId: !Ref PresignApi
+
+  PresignMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      HttpMethod: GET
+      AuthorizationType: NONE
+      ResourceId: !Ref PresignResource
+      RestApiId: !Ref PresignApi
+      Integration:
+        IntegrationHttpMethod: POST
+        Type: AWS_PROXY
+        Uri: !Sub
+          - arn:aws:apigateway:${Region}:lambda:path/2015-03-31/functions/${LambdaArn}/invocations
+          - Region: !Ref "AWS::Region"
+            LambdaArn: !GetAtt PresignUrlFunction.Arn
+  
+  PresignOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref PresignApi
+      ResourceId: !Ref PresignResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'*'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,PUT,OPTIONS'"
+            ResponseTemplates:
+              application/json: "{}"
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Origin: true
+            method.response.header.Access-Control-Allow-Methods: true
+  
+  PresignPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref PresignUrlFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${PresignApi}/${Environment}/GET/presign"
+   
+  PresignDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - PresignMethod  
+      - PresignOptionsMethod
+    Properties:
+      RestApiId: !Ref PresignApi
+      Description: !Sub "Deployment for ${ProjectName}-${Tier}-${Environment}"
+      StageName: !Ref Environment 
+  
+  UploadHTMLTrigger:
+    Type: Custom::UploadHTML
+    DependsOn:
+      - UploadHTMLFunction
+      - PresignDeployment 
+    Properties:
+      ServiceToken: !GetAtt UploadHTMLFunction.Arn
+      BucketName: !Sub ${ProjectName}-site-${Tier}-${Environment}-${AWS::AccountId}
+      ApiInvokeUrl: !Sub "https://${PresignApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}"      
+      HTMLVersion: !Ref HTMLVersion  
+ 
+Outputs:
+  UploadBucketName:
+    Description: Upload bucket name
+    Value: !Ref UploadBucket
+
+  SiteBucketName:
+    Description: Website bucket name
+    Value: !Ref WebsiteBucket
+        
+  WebsiteHttpsURL:
+    Description: Website URL
+    Value: !Sub "https://${CloudFrontDistribution.DomainName}"
+
+  UploadBucketConsoleUrl:
+    Description: Upload bucket (AWS Console)
+    Value: !Sub "https://s3.console.aws.amazon.com/s3/buckets/${UploadBucket}"
+
+  SiteBucketConsoleUrl:
+    Description: Website bucket (AWS Console)
+    Value: !Sub "https://s3.console.aws.amazon.com/s3/buckets/${WebsiteBucket}"
