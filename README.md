@@ -98,14 +98,15 @@ Because the architecture is fully serverless, there are no servers, containers o
 
 ## Extending the Solution
 
-As upload workflows become more widely used, additional requirements often emerge:
+As upload workflows become more widely used, additional requirements often emerge, such as:
 
 - Authentication
 - Upload quotas
 - Abuse protection
-- Deployment and operational workflows
+- Folder uploads with preserved directory structure
 - Custom domain management
 - Extended retention policies
+- Monitoring and operational workflows
 
 For teams that need these capabilities out of the box, S3EasyUpload Professional is available.
 
